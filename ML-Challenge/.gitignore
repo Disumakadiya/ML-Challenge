@@ -1,0 +1,2 @@
+student_resource/dataset/**/*.tsv
+student_resource/dataset/.DS_Store
