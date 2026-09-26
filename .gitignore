@@ -1,2 +1,14 @@
-student_resource/dataset/**/*.tsv
-student_resource/dataset/.DS_Store
+# Challenge datasets are large and must remain local.
+student_resource/dataset/
+
+# Python caches and generated local index files.
+__pycache__/
+*.py[cod]
+*.sqlite
+*.sqlite-*
+*.tmp
+experiments/M2_E4/config.json
+
+# OS metadata.
+.DS_Store
+desktop.ini
