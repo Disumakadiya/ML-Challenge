@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import array
 import csv
 import hashlib
 import json
@@ -88,6 +89,7 @@ def _open_ground_truth_store(
     connection: sqlite3.Connection,
     ground_truth_path: Path,
     config: ExperimentConfig,
+    create_validation_split: bool = True,
 ) -> dict[int, int]:
     connection.executescript(
         """
@@ -140,21 +142,22 @@ def _open_ground_truth_store(
             "SELECT stratum, COUNT(*) FROM ground_truth GROUP BY stratum"
         )
     }
-    for stratum, count in stratum_counts.items():
-        validation_count = min(
-            count,
-            int(math.floor(count * config.validation_fraction + 0.5)),
-        )
-        connection.execute(
-            """
-            UPDATE ground_truth SET fold='validation'
-            WHERE source1_entity_id IN (
-                SELECT source1_entity_id FROM ground_truth
-                WHERE stratum=? ORDER BY split_hash LIMIT ?
+    if create_validation_split:
+        for stratum, count in stratum_counts.items():
+            validation_count = min(
+                count,
+                int(math.floor(count * config.validation_fraction + 0.5)),
             )
-            """,
-            (stratum, validation_count),
-        )
+            connection.execute(
+                """
+                UPDATE ground_truth SET fold='validation'
+                WHERE source1_entity_id IN (
+                    SELECT source1_entity_id FROM ground_truth
+                    WHERE stratum=? ORDER BY split_hash LIMIT ?
+                )
+                """,
+                (stratum, validation_count),
+            )
 
     train_counts = {
         int(stratum): int(count)
@@ -233,14 +236,17 @@ def _selected_source1_rows(
 
 def _build_target_index(
     index: SQLiteBlockingIndex,
-    train_dir: Path,
+    data_dir: Path,
     chunksize: int,
+    split: str = "train",
 ) -> dict[str, int]:
+    if split not in {"train", "test"}:
+        raise ValueError("split must be 'train' or 'test'.")
     for source, filename in (
-        ("S2", "train_source2.tsv"),
-        ("S3", "train_source3.tsv"),
+        ("S2", f"{split}_source2.tsv"),
+        ("S3", f"{split}_source3.tsv"),
     ):
-        path = train_dir / filename
+        path = data_dir / filename
         for chunk in iter_source_chunks(
             path, chunksize=chunksize, expected_source=source
         ):
@@ -758,10 +764,309 @@ def run_experiment(config: ExperimentConfig) -> dict[str, object]:
     return metrics
 
 
+def _inference_metrics(
+    candidate_counts: array.array[int],
+    source1_count: int,
+    target_count: int,
+    prediction_count: int,
+    runtime_seconds: float,
+) -> dict[str, object]:
+    ordered_counts = sorted(candidate_counts)
+    candidate_pair_count = sum(candidate_counts)
+    median: float = 0.0
+    if ordered_counts:
+        middle = len(ordered_counts) // 2
+        median = (
+            float(ordered_counts[middle])
+            if len(ordered_counts) % 2
+            else (ordered_counts[middle - 1] + ordered_counts[middle]) / 2
+        )
+    p95 = (
+        ordered_counts[max(0, math.ceil(0.95 * len(ordered_counts)) - 1)]
+        if ordered_counts
+        else 0
+    )
+    possible_pairs = source1_count * target_count
+    return {
+        "experiment_id": "M2_E4",
+        "split": "test",
+        "source1_count": source1_count,
+        "target_count": target_count,
+        "candidate_pair_count": candidate_pair_count,
+        "prediction_count": prediction_count,
+        "candidate_count_average": (
+            candidate_pair_count / source1_count if source1_count else 0.0
+        ),
+        "candidate_count_median": median,
+        "candidate_count_p95": p95,
+        "candidate_count_max": max(ordered_counts, default=0),
+        "candidate_reduction_ratio": (
+            1.0 - candidate_pair_count / possible_pairs
+            if possible_pairs
+            else 0.0
+        ),
+        "possible_pair_count": possible_pairs,
+        "runtime_seconds": runtime_seconds,
+    }
+
+
+def run_final_inference(
+    config: ExperimentConfig,
+    test_dir: Path,
+    submission_dir: Path,
+) -> dict[str, object]:
+    """Fit on training labels and write final test candidate/match TSVs."""
+    started = time.perf_counter()
+    config.output_dir.mkdir(parents=True, exist_ok=True)
+    submission_dir.mkdir(parents=True, exist_ok=True)
+    train_paths = (
+        config.train_dir / "train_source1.tsv",
+        config.train_dir / "train_source2.tsv",
+        config.train_dir / "train_source3.tsv",
+        config.train_dir / "train_ground_truth.tsv",
+    )
+    test_paths = (
+        test_dir / "test_source1.tsv",
+        test_dir / "test_source2.tsv",
+        test_dir / "test_source3.tsv",
+    )
+    missing = [str(path) for path in (*train_paths, *test_paths) if not path.is_file()]
+    if missing:
+        raise FileNotFoundError("Missing required data file(s): " + ", ".join(missing))
+
+    blocking_config = BlockingConfig(max_bucket_size=config.max_bucket_size)
+    model_started = time.perf_counter()
+    with tempfile.TemporaryDirectory(
+        prefix="m2e4-train-", dir=submission_dir.parent
+    ) as training_directory:
+        with SQLiteBlockingIndex(
+            Path(training_directory) / "training.sqlite", blocking_config
+        ) as training_index:
+            training_connection = training_index.connection
+            label_strata = _open_ground_truth_store(
+                training_connection,
+                train_paths[3],
+                config,
+                create_validation_split=False,
+            )
+            training_target_counts = _build_target_index(
+                training_index,
+                config.train_dir,
+                config.chunk_size,
+                split="train",
+            )
+            training_source1_count = int(
+                training_connection.execute(
+                    "SELECT COUNT(*) FROM ground_truth"
+                ).fetchone()[0]
+            )
+            training_sample_count = int(
+                training_connection.execute(
+                    "SELECT COUNT(*) FROM selected_train"
+                ).fetchone()[0]
+            )
+            model, training_pair_count, training_positive_count = _train_model(
+                training_connection,
+                training_index,
+                train_paths[0],
+                config,
+            )
+            training_key_count = int(
+                training_connection.execute(
+                    "SELECT COUNT(*) FROM blocking_keys"
+                ).fetchone()[0]
+            )
+    training_seconds = time.perf_counter() - model_started
+
+    candidate_path = submission_dir / "candidate_pairs.tsv"
+    results_path = submission_dir / "matching_results.tsv"
+    candidate_temp = candidate_path.with_suffix(".tsv.tmp")
+    results_temp = results_path.with_suffix(".tsv.tmp")
+    candidate_counts = array.array("I")
+    source1_count = prediction_count = 0
+    test_started = time.perf_counter()
+    pass_candidate_counts: Counter[str] = Counter()
+
+    with tempfile.TemporaryDirectory(
+        prefix="m2e4-test-", dir=submission_dir.parent
+    ) as test_database_directory:
+        with SQLiteBlockingIndex(
+            Path(test_database_directory) / "test.sqlite", blocking_config
+        ) as test_index:
+            test_target_counts = _build_target_index(
+                test_index,
+                test_dir,
+                config.chunk_size,
+                split="test",
+            )
+            pending_groups: list[tuple[str, list[str], int, int]] = []
+            pending_features: list[list[float]] = []
+
+            def flush(candidate_writer, results_writer) -> None:
+                nonlocal prediction_count
+                if not pending_groups:
+                    return
+                probabilities = (
+                    model.predict(np.asarray(pending_features, dtype=np.float32))
+                    if pending_features
+                    else np.empty(0, dtype=np.float32)
+                )
+                for source1_id, candidate_ids, start, end in pending_groups:
+                    predicted_ids = [
+                        entity_id
+                        for entity_id, score in zip(
+                            candidate_ids, probabilities[start:end]
+                        )
+                        if float(score) >= config.prediction_threshold
+                    ]
+                    candidate_writer.writerow(
+                        [source1_id, ",".join(candidate_ids)]
+                    )
+                    results_writer.writerow(
+                        [source1_id, ",".join(predicted_ids)]
+                    )
+                    prediction_count += len(predicted_ids)
+                pending_groups.clear()
+                pending_features.clear()
+
+            with (
+                candidate_temp.open(
+                    "w", encoding="utf-8", newline=""
+                ) as candidate_file,
+                results_temp.open(
+                    "w", encoding="utf-8", newline=""
+                ) as results_file,
+            ):
+                candidate_writer = csv.writer(
+                    candidate_file, delimiter="\t", lineterminator="\n"
+                )
+                results_writer = csv.writer(
+                    results_file, delimiter="\t", lineterminator="\n"
+                )
+                candidate_writer.writerow(
+                    ["source1_entity_id", "candidate_entity_ids"]
+                )
+                results_writer.writerow(
+                    ["source1_entity_id", "matched_entity_ids"]
+                )
+                for source1_chunk in iter_source_chunks(
+                    test_paths[0],
+                    chunksize=config.chunk_size,
+                    expected_source="S1",
+                ):
+                    prepared_source1 = prepare_source(
+                        source1_chunk, expected_source="S1"
+                    )
+                    for source1 in prepared_source1.to_dict(orient="records"):
+                        source1_id = str(source1["entity_id"])
+                        passes_by_candidate = test_index.candidates(source1)
+                        candidate_ids = sorted(passes_by_candidate)
+                        target_records = test_index.get_targets(candidate_ids)
+                        if len(target_records) != len(candidate_ids):
+                            raise ValueError(
+                                "Candidate lookup referenced a missing test target."
+                            )
+                        start = len(pending_features)
+                        for entity_id in candidate_ids:
+                            pending_features.append(
+                                pair_features(
+                                    source1,
+                                    target_records[entity_id],
+                                    passes_by_candidate[entity_id],
+                                )
+                            )
+                            pass_candidate_counts.update(
+                                passes_by_candidate[entity_id]
+                            )
+                        end = len(pending_features)
+                        candidate_counts.append(len(candidate_ids))
+                        pending_groups.append(
+                            (source1_id, candidate_ids, start, end)
+                        )
+                        source1_count += 1
+                        if (
+                            len(pending_features) >= 50_000
+                            or len(pending_groups) >= 2_000
+                        ):
+                            flush(candidate_writer, results_writer)
+                flush(candidate_writer, results_writer)
+                candidate_file.flush()
+                results_file.flush()
+                os.fsync(candidate_file.fileno())
+                os.fsync(results_file.fileno())
+
+    os.replace(candidate_temp, candidate_path)
+    os.replace(results_temp, results_path)
+    test_target_count = sum(test_target_counts.values())
+    metrics = _inference_metrics(
+        candidate_counts,
+        source1_count,
+        test_target_count,
+        prediction_count,
+        time.perf_counter() - started,
+    )
+    metrics.update(
+        {
+            "training_source1_count": training_source1_count,
+            "training_source1_sample_count": training_sample_count,
+            "training_target_counts": training_target_counts,
+            "training_target_count": sum(training_target_counts.values()),
+            "training_candidate_pairs_sampled": training_pair_count,
+            "training_positive_pairs": training_positive_count,
+            "training_blocking_key_count": training_key_count,
+            "training_match_count_strata": {
+                "singletons": label_strata.get(0, 0),
+                "one_match": label_strata.get(1, 0),
+                "multi_match": label_strata.get(2, 0),
+            },
+            "test_target_counts": test_target_counts,
+            "blocking_passes": list(BLOCKING_PASSES),
+            "max_bucket_size": config.max_bucket_size,
+            "prediction_threshold": config.prediction_threshold,
+            "model": "LightGBM native binary booster; 300 trees; fixed threshold",
+            "features": list(FEATURE_NAMES),
+            "training_sampling_note": (
+                "Model fit uses a deterministic match-count-stratified sample "
+                "of training Source 1 entities; all training Source 2/3 records "
+                "are indexed, and negatives are deterministically capped and "
+                "weighted. No test labels are read."
+            ),
+            "training_runtime_seconds": training_seconds,
+            "test_inference_runtime_seconds": time.perf_counter() - test_started,
+            "blocking_pass_candidate_pair_counts": dict(
+                sorted(pass_candidate_counts.items())
+            ),
+            "candidate_pairs_path": str(candidate_path),
+            "matching_results_path": str(results_path),
+            "submission_note": (
+                "The two TSV files are generated from the test split. "
+                "metrics.json is run metadata and is not a submission TSV."
+            ),
+        }
+    )
+    metrics_path = submission_dir / "metrics.json"
+    metrics_temp = metrics_path.with_suffix(".json.tmp")
+    metrics_temp.write_text(
+        json.dumps(metrics, indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    os.replace(metrics_temp, metrics_path)
+    return metrics
+
+
 def main(argv: Sequence[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(
+        description="Run M2_E4 train validation or generate final test submissions."
+    )
+    parser.add_argument(
+        "--final-inference",
+        action="store_true",
+        help="fit from training data and create submission files from test data",
+    )
     parser.add_argument("--train-dir", type=Path, default=Path("student_resource/dataset/train"))
+    parser.add_argument("--test-dir", type=Path, default=Path("student_resource/dataset/test"))
     parser.add_argument("--output-dir", type=Path, default=Path("experiments/M2_E4"))
+    parser.add_argument("--submission-dir", type=Path, default=Path("output"))
     parser.add_argument("--validation-fraction", type=float, default=0.2)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--max-train-entities", type=int, default=25_000)
@@ -781,7 +1086,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         max_bucket_size=args.max_bucket_size,
         prediction_threshold=args.threshold,
     )
-    metrics = run_experiment(config)
+    metrics = (
+        run_final_inference(config, args.test_dir, args.submission_dir)
+        if args.final_inference
+        else run_experiment(config)
+    )
     print(json.dumps(metrics, indent=2, ensure_ascii=False))
     return 0
 
