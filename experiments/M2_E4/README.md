@@ -1,6 +1,6 @@
 # M2_E4: multi-pass blocking + LightGBM
 
-Run from the `ML-Challenge/` project root:
+Run the train-only validation experiment from the `ML-Challenge/` project root:
 
 ```powershell
 python -m pip install -r requirements.txt
@@ -27,5 +27,36 @@ threshold is fixed at 0.5 by default and is not selected using test data.
 
 Defaults are configurable through CLI options; use `python -m
 experiments.M2_E4.run_experiment --help` for the option list. The notebook
-`notebooks/member2/M2_E4_multipass_lgbm.ipynb` is an orchestration wrapper for
-the same runner, not a separate implementation.
+`notebooks/member2/M2_E4_multipass_lgbm.ipynb` runs final inference and creates
+the test-set files required for submission. From the project root, the same
+operation can be run without Jupyter:
+
+```powershell
+python -m experiments.M2_E4.run_experiment --final-inference
+```
+
+It trains using the training TSVs and ground truth only, then builds a
+disk-backed candidate index from all test Source 2 and Source 3 records and
+writes one output row for every test Source 1 ID. The official submission files
+are `output/matching_results.tsv` and `output/candidate_pairs.tsv`.
+`output/metrics.json` records candidate counts and runtime; it is not one of
+the two challenge TSV submissions. Every predicted ID is selected from the
+candidate set by construction, and candidates come from the test target index.
+The threshold is fixed at 0.5; the test labels are never read or used for model
+selection.
+
+After completion, validate the files from `student_resource/`:
+
+```powershell
+python utils/validate_submission.py `
+  --matching ../output/matching_results.tsv `
+  --candidate ../output/candidate_pairs.tsv `
+  --test-dir dataset/test
+```
+
+The inference process uses temporary SQLite indexes under the output
+directory's parent and removes them on successful completion or failure. It
+does not write to `student_resource/dataset/`. Full train/test indexing may take
+substantial time and temporary disk space; do not stop the process before it
+finishes. An interrupted/failed run can leave incomplete temporary TSV files;
+rerun to replace them.

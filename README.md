@@ -165,20 +165,30 @@ Chunked loading alone does not make corpus-wide blocking or TF-IDF out-of-core.
 ## 6. M2_E4 experiment
 
 M2_E4's reusable multi-pass blocker is in
-`src/blocking/multipass_blocking.py`; its train-only LightGBM validation runner
-is in `experiments/M2_E4/run_experiment.py`. From this project root:
+`src/blocking/multipass_blocking.py`. Run its train-only LightGBM validation
+runner from the project root with:
 
 ```bash
 python -m pip install -r requirements.txt
 python -m experiments.M2_E4.run_experiment
 ```
 
-The runner uses a deterministic Source 1 match-count-stratified 20% validation
-holdout (seed 42), indexes all S2/S3 training records in temporary SQLite, and
-fits on a reproducible cap of Source 1 training entities with capped,
-deterministically sampled negatives. It does not load the test split. See
-`experiments/M2_E4/README.md` for options and artifact details. Validation
-outputs are not test submissions.
+To create test predictions for submission instead, run all cells in
+`notebooks/member2/M2_E4_multipass_lgbm.ipynb`, or use:
+
+```bash
+python -m experiments.M2_E4.run_experiment --final-inference
+```
+
+Final inference fits only on training data/labels, then indexes all test S2/S3
+records and writes the official `output/matching_results.tsv` and
+`output/candidate_pairs.tsv` (one row for each test S1 entity). It also writes
+`output/metrics.json`, which is a report and not a submission TSV. Predictions
+are generated only from their candidate lists. Validate both TSVs using the
+provided validator before submission. The run uses disk-backed SQLite and can
+take substantial time and temporary disk space. See
+`experiments/M2_E4/README.md` for details. The validation-only runner writes
+separate fold outputs and does not create test submissions.
 
 ## 7. Experiment reporting and constraints
 

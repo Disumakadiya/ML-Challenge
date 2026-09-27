@@ -1,11 +1,17 @@
 import csv
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 
 import pandas as pd
 
-from experiments.M2_E4.run_experiment import ExperimentConfig, run_experiment
+from experiments.M2_E4.run_experiment import (
+    ExperimentConfig,
+    run_experiment,
+    run_final_inference,
+)
 
 
 class M2E4ExperimentTests(unittest.TestCase):
@@ -114,6 +120,168 @@ class M2E4ExperimentTests(unittest.TestCase):
                     predicted_ids.issubset(candidate_ids[row["source1_entity_id"]])
                 )
             self.assertTrue((output_dir.parent / "experiment_results.csv").is_file())
+
+    def test_final_inference_writes_test_submission_files_for_every_source1(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            train_dir = root / "train"
+            test_dir = root / "test"
+            experiment_dir = root / "experiments" / "M2_E4"
+            submission_dir = root / "output"
+            train_dir.mkdir()
+            test_dir.mkdir()
+
+            source_columns = (
+                "entity_id",
+                "business_name",
+                "business_address",
+                "country",
+            )
+            train_source1 = []
+            train_source2 = []
+            train_source3 = []
+            truth_rows = []
+            for index in range(60):
+                source1_id = f"S1-{index:05d}"
+                name = f"Training Company {index} Cafe"
+                address = f"{index + 100} Main Road"
+                country = ("US", "India", "France")[index % 3]
+                train_source1.append((source1_id, name, address, country))
+                source2_id = f"S2-{index:05d}"
+                train_source2.append((source2_id, name, address, country))
+                train_source3.append(
+                    (
+                        f"S3-{index:05d}",
+                        f"Cafe {index} Company Training",
+                        address,
+                        country,
+                    )
+                )
+                truth_rows.append((source1_id, source2_id))
+
+            train_tables = (
+                ("train_source1.tsv", train_source1),
+                ("train_source2.tsv", train_source2),
+                ("train_source3.tsv", train_source3),
+            )
+            for filename, rows in train_tables:
+                pd.DataFrame(rows, columns=source_columns).to_csv(
+                    train_dir / filename, sep="\t", index=False
+                )
+            pd.DataFrame(
+                truth_rows,
+                columns=("source1_entity_id", "matched_entity_ids"),
+            ).to_csv(
+                train_dir / "train_ground_truth.tsv", sep="\t", index=False
+            )
+
+            test_source1 = [
+                ("S1-T0001", "Test Cedar Market", "21 Cedar Street", "France"),
+                ("S1-T0002", "Test Lonely Business", "", "A new country"),
+            ]
+            test_source2 = [
+                ("S2-T0001", "Cedar Test Market", "21 Cedar St", "France"),
+                ("S2-T0002", "Unrelated Target", "99 Other Road", "US"),
+            ]
+            test_source3 = [
+                ("S3-T0001", "Completely Separate", "80 Birch Lane", "India")
+            ]
+            for filename, rows in (
+                ("test_source1.tsv", test_source1),
+                ("test_source2.tsv", test_source2),
+                ("test_source3.tsv", test_source3),
+            ):
+                pd.DataFrame(rows, columns=source_columns).to_csv(
+                    test_dir / filename, sep="\t", index=False
+                )
+
+            metrics = run_final_inference(
+                ExperimentConfig(
+                    train_dir=train_dir,
+                    output_dir=experiment_dir,
+                    max_train_entities=50,
+                    negative_samples_per_entity=10,
+                    chunk_size=20,
+                    max_bucket_size=100,
+                ),
+                test_dir=test_dir,
+                submission_dir=submission_dir,
+            )
+
+            candidate_path = submission_dir / "candidate_pairs.tsv"
+            matching_path = submission_dir / "matching_results.tsv"
+            self.assertTrue(candidate_path.is_file())
+            self.assertTrue(matching_path.is_file())
+            self.assertTrue((submission_dir / "metrics.json").is_file())
+            with candidate_path.open(encoding="utf-8", newline="") as handle:
+                candidates = list(csv.DictReader(handle, delimiter="\t"))
+            with matching_path.open(encoding="utf-8", newline="") as handle:
+                predictions = list(csv.DictReader(handle, delimiter="\t"))
+            expected_source1_ids = {row[0] for row in test_source1}
+            self.assertEqual(
+                {row["source1_entity_id"] for row in candidates},
+                expected_source1_ids,
+            )
+            self.assertEqual(
+                {row["source1_entity_id"] for row in predictions},
+                expected_source1_ids,
+            )
+            candidates_by_source1 = {
+                row["source1_entity_id"]: set(
+                    filter(None, row["candidate_entity_ids"].split(","))
+                )
+                for row in candidates
+            }
+            test_target_ids = {
+                row[0] for row in test_source2 + test_source3
+            }
+            for row in candidates:
+                candidate_ids = candidates_by_source1[row["source1_entity_id"]]
+                self.assertTrue(candidate_ids.issubset(test_target_ids))
+            for row in predictions:
+                predicted_ids = set(
+                    filter(None, row["matched_entity_ids"].split(","))
+                )
+                self.assertTrue(
+                    predicted_ids.issubset(
+                        candidates_by_source1[row["source1_entity_id"]]
+                    )
+                )
+            self.assertEqual(metrics["source1_count"], len(test_source1))
+            self.assertEqual(metrics["target_count"], len(test_target_ids))
+            self.assertEqual(
+                metrics["prediction_count"],
+                sum(
+                    len(list(filter(None, row["matched_entity_ids"].split(","))))
+                    for row in predictions
+                ),
+            )
+            validator = (
+                Path(__file__).resolve().parents[1]
+                / "student_resource"
+                / "utils"
+                / "validate_submission.py"
+            )
+            validation = subprocess.run(
+                [
+                    sys.executable,
+                    str(validator),
+                    "--matching",
+                    str(matching_path),
+                    "--candidate",
+                    str(candidate_path),
+                    "--test-dir",
+                    str(test_dir),
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(
+                validation.returncode,
+                0,
+                msg=validation.stdout + validation.stderr,
+            )
 
 
 if __name__ == "__main__":

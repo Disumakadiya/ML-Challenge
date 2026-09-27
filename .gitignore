@@ -8,6 +8,11 @@ __pycache__/
 *.sqlite-*
 *.tmp
 experiments/M2_E4/config.json
+experiments/M2_E4/candidate_pairs.tsv
+experiments/M2_E4/matching_results.tsv
+experiments/M2_E4/metrics.json
+output/*.tsv
+output/metrics.json
 
 # OS metadata.
 .DS_Store
