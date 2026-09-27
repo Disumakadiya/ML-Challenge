@@ -11,6 +11,12 @@ experiments/M2_E4/config.json
 experiments/M2_E4/candidate_pairs.tsv
 experiments/M2_E4/matching_results.tsv
 experiments/M2_E4/metrics.json
+experiments/M2_E5/config.json
+experiments/M2_E5/candidate_pairs.tsv
+experiments/M2_E5/matching_results.tsv
+experiments/M2_E5/metrics.json
+experiments/M2_E5/artifacts/
+experiments/M2_E5/m2e5-s3-stage/
 output/*.tsv
 output/metrics.json
 
